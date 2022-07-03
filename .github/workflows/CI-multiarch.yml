@@ -1,0 +1,140 @@
+name: CI-new
+on:
+  push:
+    branches:
+      - staging
+      - testing
+      - '1.9'
+      - master
+      # test branches, e.g. test-debian
+      - test-*
+
+concurrency: ci-${{ github.ref }}
+
+# Global environment variables
+env:
+  DOCKER_ORG: "leolivier"
+  DOCKER_PREFIX: "mailu-test-"
+  PINNED_MAILU_VERSION: "1.9-multiarch"
+  PUSH_IMAGES: ${{ github.event_name == 'release' }}
+
+###############################################
+# REQUIRED secrets
+# DOCKER_UN: ${{ secrets.Docker_Login }}
+#    Username of docker login for pushing the images to repo $DOCKER_ORG and $DOCKER_ORG_TESTS
+# DOCKER_PW: ${{ secrets.Docker_Password }}
+#    Password of docker login for pushing the images to repo $DOCKER_ORG and $DOCKER_ORG_TESTS
+# DOCKER_ORG: ${{ secrets.DOCKER_ORG }}
+#    The docker repository where the images are pushed to.
+# DOCKER_ORG_TESTS: ${{ secrets.DOCKER_ORG_TESTS }}
+#    The docker repository for test images. Only used for the branch TESTING (BORS try).
+# Add the above secrets to your github repo to determine where the images will be pushed.
+################################################
+# Code block that is used as one liner.
+##!/bin/bash
+#version=$( git tag --sort=version:refname --list "{{ env.MAILU_VERSION }}.*" | tail -1  )
+#root_version=${version%.*}
+#patch_version=${version##*.}
+#if [ "$patch_version" == "" ]
+#then
+#  pinned_version={{ env.MAILU_VERSION }}.0
+#else
+#  pinned_version=$root_version.$(expr $patch_version + 1)
+#fi
+#echo "PINNED_MAILU_VERSION=$pinned_version" >> $GITHUB_ENV
+
+jobs:
+  build:
+    name: Build images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          # fetch-depth 0 is required to also retrieve all tags.
+          fetch-depth: 0
+      - name: Extract branch name
+        shell: bash
+        run: |
+          echo "BRANCH=${GITHUB_REF#refs/heads/}" >> $GITHUB_ENV
+        #For branch TESTING, we set the image tag to PR-xxxx
+      - name: Derive MAILU_VERSION and PINNED_MAILU_VERSION for branch testing
+        if: ${{ env.BRANCH == 'testing' }}
+        shell: bash
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          DOCKER_ORG_TESTS: ${{ secrets.DOCKER_ORG_TESTS }}
+        run: |
+          echo "MAILU_VERSION=pr-${COMMIT_MESSAGE//[!0-9]/}" >> $GITHUB_ENV
+          echo "PINNED_MAILU_VERSION=pr-${COMMIT_MESSAGE//[!0-9]/}" >> $GITHUB_ENV
+          echo "DOCKER_ORG=$DOCKER_ORG_TESTS" >> $GITHUB_ENV
+      - name: Derive MAILU_VERSION for other branches than testing
+        if: ${{ env.BRANCH != 'testing' }}
+        shell: bash
+        env:
+          DOCKER_ORG: ${{ secrets.DOCKER_ORG }}
+        run: |
+          echo "MAILU_VERSION=${{ env.BRANCH }}" >> $GITHUB_ENV
+          echo "DOCKER_ORG=$DOCKER_ORG" >> $GITHUB_ENV
+      - name: Derive PINNED_MAILU_VERSION for normal release x.y
+        if: ${{ env.BRANCH != 'testing' && env.BRANCH != 'staging' && env.BRANCH != 'master' }}
+        shell: bash
+        run: |
+          version=$( git tag --sort=version:refname --list "${{ env.MAILU_VERSION }}.*" | tail -1  );root_version=${version%.*};patch_version=${version##*.};if [ "$patch_version" == "" ]; then pinned_version=${{ env.MAILU_VERSION }}.0; else pinned_version=$root_version.$(expr $patch_version + 1); fi;echo "PINNED_MAILU_VERSION=$pinned_version" >> $GITHUB_ENV
+      - name: Derive PINNED_MAILU_VERSION for staging
+        if: ${{ env.BRANCH == 'staging' }}
+        shell: bash
+        run: |
+          echo "PINNED_MAILU_VERSION=staging" >> $GITHUB_ENV      
+      - name: Derive PINNED_MAILU_VERSION for master
+        if: ${{ env.BRANCH == 'master' }}
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ env.GITHUB_SHA }}
+        run: |
+          echo "PINNED_MAILU_VERSION=$GITHUB_SHA" >> $GITHUB_ENV
+      - name: Create folder for storing images
+        run: |
+          sudo mkdir -p /images
+          sudo chmod 777 /images
+      - name: Configure images folder for caching
+        uses: actions/cache@v2
+        with:
+          path: /images
+          key: ${{ env.BRANCH }}-${{ github.run_id }}-${{ github.run_number }}
+ # QEMU setup
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+ # Setup buildx
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Check docker buildx version
+        run: docker buildx version
+      - name: Login to DockerHub
+        uses: docker/login-action@v1
+        if: env.PUSH_IMAGES == 'true'
+        with:
+          username: ${{ secrets.Docker_Login }}
+          password: ${{ secrets.Docker_Password }}
+      - uses: crazy-max/ghaction-github-runtime@v1
+      - name: Build and optionally push
+        uses: docker/bake-action@v1.7.0
+        with:
+          push: ${{ env.PUSH_IMAGES }}
+          set: |
+            "*.args.VERSION=${{ env.VERSION_FILE }}"
+            "*.args.pinned_version=${{ env.VERSION_FILE }}"
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
+# This job is watched by bors. It only complets if building,testing and deploy worked.
+  ci-success:
+    name: CI-Done
+    #Returns true when none of the **previous** steps have failed or have been canceled.
+    if: ${{ success() }}
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI/CD succeeded.
+        run: exit 0
